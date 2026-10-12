@@ -103,23 +103,12 @@ onBeforeUnmount(() => {
       </Motion>
     </div>
 
-    <div class="relative z-10 mt-auto pt-32 md:pt-44 pb-4">
-      <div class="max-w-4xl mx-auto px-6 flex items-center justify-between">
-        <div class="text-xs font-mono italic tracking-tight text-muted">
-          &copy; {{ new Date().getFullYear() }} - Made by
-          <a href="https://hrcd.fr/" target="_blank" rel="noopener noreferrer" class="hover:underline text-muted">HugoRCD</a>
-        </div>
-        <div class="flex items-center gap-3">
-          <a href="https://x.com/hugorcd" target="_blank" rel="noopener noreferrer" aria-label="X" class="text-muted hover:text-dimmed transition-colors">
-            <UIcon name="i-simple-icons-x" class="size-4" />
-          </a>
-          <a href="https://github.com/evloghq/evlog" target="_blank" rel="noopener noreferrer" aria-label="GitHub" class="text-muted hover:text-dimmed transition-colors">
-            <UIcon name="i-simple-icons-github" class="size-4" />
-          </a>
-        </div>
-      </div>
+    <!-- Keeps the gradient's original height now that the footer sits below it. -->
+    <div class="relative z-10 mt-auto pt-32 md:pt-44 pb-4" aria-hidden="true">
+      <div class="h-4" />
     </div>
   </section>
+  <LandingFooter />
 </template>
 
 <style scoped>
