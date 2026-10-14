@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { WideEvent } from '../../src/types'
-import { sendBatchToSentry, sendToSentry, toSentryLog, createSentryDrain } from '../../src/adapters/sentry'
+import { defined } from '../helpers/defined'
+import { sendBatchToSentry, sendToSentry, toSentryErrorEvent, toSentryLog, createSentryDrain } from '../../src/adapters/sentry'
 
 describe('sentry adapter', () => {
   let fetchSpy: ReturnType<typeof vi.spyOn>
@@ -295,6 +296,75 @@ describe('sentry adapter', () => {
       })
 
       expect(setTimeoutSpy).toHaveBeenCalledWith(expect.any(Function), 10000)
+    })
+  })
+
+  describe('issues', () => {
+    const dsn = 'https://public@o0.ingest.sentry.io/123'
+    const traceId = '4bf92f3577b34da6a3ce929d0e0e4736'
+
+    function envelopes() {
+      return fetchSpy.mock.calls.map((call) => {
+        const [, init] = call as [string, RequestInit]
+        const [header, item, payload] = String(init.body).split('\n')
+        return { header: JSON.parse(header ?? ''), item: JSON.parse(item ?? ''), payload: JSON.parse(payload ?? '') }
+      })
+    }
+
+    it('maps an error wide event to a Sentry error event in its trace', () => {
+      const result = toSentryErrorEvent(createTestEvent({
+        level: 'error',
+        method: 'POST',
+        path: '/api/checkout',
+        traceId,
+        spanId: '00f067aa0ba902b7',
+        parentSpanId: 'b7ad6b7169203331',
+        version: '1.2.0',
+        error: { name: 'PaymentError', message: 'Card declined' },
+      }), { dsn, tags: { team: 'payments' } })
+
+      expect(result).toMatchObject({
+        level: 'error',
+        logger: 'evlog',
+        environment: 'test',
+        release: '1.2.0',
+        transaction: 'POST /api/checkout',
+        exception: { values: [{ type: 'PaymentError', value: 'Card declined' }] },
+        contexts: { trace: { trace_id: traceId, span_id: '00f067aa0ba902b7', parent_span_id: 'b7ad6b7169203331' } },
+        tags: { service: 'test-service', team: 'payments' },
+      })
+      expect(result.event_id).toMatch(/^[a-f0-9]{32}$/)
+    })
+
+    it('sends only the log envelope when issues are off', async () => {
+      await sendBatchToSentry([createTestEvent({ level: 'error', traceId })], { dsn })
+
+      expect(envelopes().map(e => e.item.type)).toEqual(['log'])
+    })
+
+    it('opens an issue for error and fatal events, sharing the log trace id', async () => {
+      await sendBatchToSentry([
+        createTestEvent({ level: 'info', traceId: 'a'.repeat(32) }),
+        createTestEvent({ level: 'error', traceId, error: { name: 'Error', message: 'boom' } }),
+        createTestEvent({ level: 'fatal' }),
+      ], { dsn, issues: true })
+
+      const [logs, ...issues] = envelopes()
+      expect(defined(logs, 'log envelope').item.type).toBe('log')
+      expect(issues.map(e => e.item.type)).toEqual(['event', 'event'])
+      const [errorIssue, fatalIssue] = issues.map(e => e.payload)
+      expect(errorIssue.contexts.trace.trace_id).toBe(traceId)
+      expect(logs?.payload.items[1].trace_id).toBe(traceId)
+      expect(fatalIssue.level).toBe('fatal')
+      expect(fatalIssue.contexts.trace.trace_id).toBe(logs?.payload.items[2].trace_id)
+      expect(issues[0]?.header.event_id).toBe(errorIssue.event_id)
+    })
+
+    it('reads issues from the drain config', async () => {
+      const drain = createSentryDrain({ dsn, issues: true })
+      await drain({ event: createTestEvent({ level: 'error', traceId }) })
+
+      expect(envelopes().map(e => e.item.type)).toEqual(['log', 'event'])
     })
   })
 

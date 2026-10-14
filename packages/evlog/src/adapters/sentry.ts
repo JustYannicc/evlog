@@ -2,7 +2,7 @@ import type { WideEvent } from '../types'
 import type { ConfigField } from '../shared/config'
 import { formatPublicEnvKeys, resolveAdapterConfig } from '../shared/config'
 import type { HttpDrainRequest } from '../shared/drain'
-import { defineHttpDrain, sendEncodedDrainRequest } from '../shared/drain'
+import { defineDrain, sendEncodedDrainRequest } from '../shared/drain'
 import { OTEL_SEVERITY_NUMBER } from '../shared/severity'
 
 export interface SentryConfig {
@@ -18,6 +18,12 @@ export interface SentryConfig {
   timeout?: number
   /** Number of retry attempts on transient failures. Default: 2 */
   retries?: number
+  /**
+   * Also send `error` and `fatal` wide events as Sentry error events, so they open
+   * issues and trigger issue alerts. The issue carries the wide event's `trace_id`.
+   * Default: false
+   */
+  issues?: boolean
 }
 
 /** Sentry Log attribute value with type annotation */
@@ -36,6 +42,21 @@ export interface SentryLog {
   attributes?: Record<string, SentryAttributeValue>
 }
 
+/** Sentry error event payload, sent for `error` and `fatal` wide events when `issues` is set */
+export interface SentryErrorEvent {
+  event_id: string
+  timestamp: number
+  platform: 'javascript'
+  level: 'error' | 'fatal'
+  logger: 'evlog'
+  environment?: string
+  release?: string
+  transaction?: string
+  exception: { values: Array<{ type: string, value: string }> }
+  contexts: { trace: { trace_id: string, span_id: string, parent_span_id?: string } }
+  tags: Record<string, string>
+}
+
 interface SentryDsnParts {
   publicKey: string
   secretKey?: string
@@ -51,6 +72,7 @@ const SENTRY_FIELDS: ConfigField<SentryConfig>[] = [
   { key: 'tags' },
   { key: 'timeout' },
   { key: 'retries' },
+  { key: 'issues' },
 ]
 
 function parseSentryDsn(dsn: string): SentryDsnParts {
@@ -95,6 +117,15 @@ function createTraceId(): string {
   }
 
   return Array.from({ length: 32 }, () => Math.floor(Math.random() * 16).toString(16)).join('')
+}
+
+function nonEmptyString(value: unknown): string | undefined {
+  return typeof value === 'string' && value.length > 0 ? value : undefined
+}
+
+/** Give an event without a `traceId` one, so its log and its issue share it. */
+function withTraceId(event: WideEvent): WideEvent {
+  return nonEmptyString(event.traceId) ? event : { ...event, traceId: createTraceId() }
 }
 
 function getFirstStringValue(event: WideEvent, keys: string[]): string | undefined {
@@ -174,6 +205,48 @@ export function toSentryLog(event: WideEvent, config: SentryConfig): SentryLog {
 }
 
 /**
+ * Convert an `error` or `fatal` wide event to a Sentry error event. The trace
+ * context comes from the event's `traceId`, `spanId` and `parentSpanId`, so the
+ * issue links to the trace and its logs.
+ */
+export function toSentryErrorEvent(event: WideEvent, config: SentryConfig): SentryErrorEvent {
+  const error = (typeof event.error === 'object' && event.error !== null ? event.error : {}) as Record<string, unknown>
+  const method = nonEmptyString(event.method)
+  const path = nonEmptyString(event.path)
+  const transaction = method && path ? `${method} ${path}` : nonEmptyString(event.action) ?? path
+  const parentSpanId = nonEmptyString(event.parentSpanId)
+  const environment = config.environment ?? event.environment
+  const release = config.release ?? nonEmptyString(event.version)
+
+  return {
+    event_id: createTraceId(),
+    timestamp: new Date(event.timestamp).getTime() / 1000,
+    platform: 'javascript',
+    level: event.level === 'fatal' ? 'fatal' : 'error',
+    logger: 'evlog',
+    ...(environment ? { environment } : {}),
+    ...(release ? { release } : {}),
+    ...(transaction ? { transaction } : {}),
+    exception: {
+      values: [
+        {
+          type: nonEmptyString(error.name) ?? 'Error',
+          value: nonEmptyString(error.message) ?? getFirstStringValue(event, ['message', 'action', 'path']) ?? 'evlog wide event',
+        }
+      ],
+    },
+    contexts: {
+      trace: {
+        trace_id: nonEmptyString(event.traceId) ?? createTraceId(),
+        span_id: nonEmptyString(event.spanId) ?? createTraceId().slice(0, 16),
+        ...(parentSpanId ? { parent_span_id: parentSpanId } : {}),
+      },
+    },
+    tags: { service: event.service, ...config.tags },
+  }
+}
+
+/**
  * Build the Sentry Envelope body for a list of logs.
  *
  * Envelope format (line-delimited):
@@ -222,7 +295,7 @@ function buildEnvelopeBody(logs: SentryLog[], dsn: string): string {
  * ```
  */
 export function createSentryDrain(overrides?: Partial<SentryConfig>) {
-  return defineHttpDrain<SentryConfig>({
+  return defineDrain<SentryConfig>({
     name: 'sentry',
     resolve: async () => {
       const config = await resolveAdapterConfig<SentryConfig>('sentry', SENTRY_FIELDS, overrides)
@@ -232,26 +305,38 @@ export function createSentryDrain(overrides?: Partial<SentryConfig>) {
       }
       return config as SentryConfig
     },
-    label: 'Sentry',
-    encode: encodeSentryRequest,
+    send: sendBatchToSentry,
+    // Raw callers (the pipeline) own retries: single attempt unless the config sets retries explicitly.
+    rawSend: (events, config) => sendBatchToSentry(events, { ...config, retries: config.retries ?? 0 }),
   })
 }
 
-/**
- * Encode a batch of wide events into the Sentry envelope request. Shared by
- * {@link createSentryDrain} and {@link sendBatchToSentry}.
- */
-function encodeSentryRequest(events: WideEvent[], config: SentryConfig): HttpDrainRequest {
+function getSentryEnvelopeRequest(config: SentryConfig, body: string): HttpDrainRequest {
   const { url, authHeader } = getSentryEnvelopeUrl(config.dsn)
-  const logs = events.map(event => toSentryLog(event, config))
   return {
     url,
     headers: {
       'Content-Type': 'application/x-sentry-envelope',
       'X-Sentry-Auth': authHeader,
     },
-    body: buildEnvelopeBody(logs, config.dsn),
+    body,
   }
+}
+
+/**
+ * Encode a batch of wide events into the Sentry envelope request carrying
+ * their structured logs.
+ */
+function encodeSentryRequest(events: WideEvent[], config: SentryConfig): HttpDrainRequest {
+  const logs = events.map(event => toSentryLog(event, config))
+  return getSentryEnvelopeRequest(config, buildEnvelopeBody(logs, config.dsn))
+}
+
+/** An envelope holds at most one error event, so each issue gets its own request. */
+function encodeSentryErrorEventRequest(event: SentryErrorEvent, config: SentryConfig): HttpDrainRequest {
+  const envelopeHeader = JSON.stringify({ event_id: event.event_id, dsn: config.dsn, sent_at: new Date().toISOString() })
+  const itemHeader = JSON.stringify({ type: 'event', content_type: 'application/json' })
+  return getSentryEnvelopeRequest(config, `${envelopeHeader}\n${itemHeader}\n${JSON.stringify(event)}\n`)
 }
 
 /**
@@ -270,6 +355,7 @@ export async function sendToSentry(event: WideEvent, config: SentryConfig): Prom
 
 /**
  * Send a batch of events to Sentry as structured logs via the Envelope endpoint.
+ * With `issues`, `error` and `fatal` events are also sent as error events.
  *
  * @example
  * ```ts
@@ -280,10 +366,19 @@ export async function sendToSentry(event: WideEvent, config: SentryConfig): Prom
  */
 export async function sendBatchToSentry(events: WideEvent[], config: SentryConfig): Promise<void> {
   if (events.length === 0) return
-  await sendEncodedDrainRequest(encodeSentryRequest(events, config), {
+  const traced = events.map(withTraceId)
+  const requests = [encodeSentryRequest(traced, config)]
+  if (config.issues) {
+    for (const event of traced) {
+      if (event.level === 'error' || event.level === 'fatal') {
+        requests.push(encodeSentryErrorEventRequest(toSentryErrorEvent(event, config), config))
+      }
+    }
+  }
+  await Promise.all(requests.map(request => sendEncodedDrainRequest(request, {
     label: 'Sentry',
     source: 'sentry',
     timeout: config.timeout,
     retries: config.retries,
-  })
+  })))
 }
