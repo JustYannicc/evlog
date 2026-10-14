@@ -124,8 +124,20 @@ function nonEmptyString(value: unknown): string | undefined {
 }
 
 /** Give an event without a `traceId` one, so its log and its issue share it. */
+// Generated ids are cached per event so a retried batch resends the same ids and Sentry drops the duplicate issue.
+const tracedEvents = new WeakMap<WideEvent, WideEvent>()
+const issueEventIds = new WeakMap<WideEvent, string>()
+
+function cached<T>(cache: WeakMap<WideEvent, T>, event: WideEvent, create: () => T): T {
+  const existing = cache.get(event)
+  if (existing !== undefined) return existing
+  const value = create()
+  cache.set(event, value)
+  return value
+}
+
 function withTraceId(event: WideEvent): WideEvent {
-  return nonEmptyString(event.traceId) ? event : { ...event, traceId: createTraceId() }
+  return nonEmptyString(event.traceId) ? event : cached(tracedEvents, event, () => ({ ...event, traceId: createTraceId() }))
 }
 
 function getFirstStringValue(event: WideEvent, keys: string[]): string | undefined {
@@ -219,7 +231,7 @@ export function toSentryErrorEvent(event: WideEvent, config: SentryConfig): Sent
   const release = config.release ?? nonEmptyString(event.version)
 
   return {
-    event_id: createTraceId(),
+    event_id: cached(issueEventIds, event, createTraceId),
     timestamp: new Date(event.timestamp).getTime() / 1000,
     platform: 'javascript',
     level: event.level === 'fatal' ? 'fatal' : 'error',

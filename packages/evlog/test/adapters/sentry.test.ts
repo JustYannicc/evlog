@@ -360,6 +360,17 @@ describe('sentry adapter', () => {
       expect(issues[0]?.header.event_id).toBe(errorIssue.event_id)
     })
 
+    it('resends a retried batch with the same issue event id and trace id', async () => {
+      const batch = [createTestEvent({ level: 'error' })]
+      await sendBatchToSentry(batch, { dsn, issues: true })
+      await sendBatchToSentry(batch, { dsn, issues: true })
+
+      const [firstLogs, firstIssue, retryLogs, retryIssue] = envelopes()
+      expect(retryIssue?.payload.event_id).toBe(firstIssue?.payload.event_id)
+      expect(retryIssue?.payload.contexts.trace.trace_id).toBe(firstIssue?.payload.contexts.trace.trace_id)
+      expect(retryLogs?.payload.items[0].trace_id).toBe(firstLogs?.payload.items[0].trace_id)
+    })
+
     it('reads issues from the drain config', async () => {
       const drain = createSentryDrain({ dsn, issues: true })
       await drain({ event: createTestEvent({ level: 'error', traceId }) })
