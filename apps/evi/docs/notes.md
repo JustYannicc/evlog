@@ -232,9 +232,5 @@ purpose: single-user surface, a static bearer is the right size.
 ## Open
 
 - A `toTelemetry(output)` mirror of `toModelOutput`, so a tool can carry
-  diagnostics that never cost a context token (EVL-366 closed without the
-  capability landing; the decision is still open, so the entry stays).
-
-Landed since this list was written: per-tool input tokens on `ai.tools[]`
-(#622), the resolved provider as `ai.provider` (#622), and GitHub rate-limit
-state on tool results (EVL-343, in the github-tools extension).
+  diagnostics that never cost a context token (tracked in EVL-509; EVL-366 closed
+  without the capability landing, so the entry stays).
