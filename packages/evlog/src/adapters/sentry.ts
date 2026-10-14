@@ -3,6 +3,7 @@ import type { ConfigField } from '../shared/config'
 import { formatPublicEnvKeys, resolveAdapterConfig } from '../shared/config'
 import type { HttpDrainRequest } from '../shared/drain'
 import { defineDrain, sendEncodedDrainRequest } from '../shared/drain'
+import { parseStackFrames } from '../shared/pretty-error'
 import { OTEL_SEVERITY_NUMBER } from '../shared/severity'
 
 export interface SentryConfig {
@@ -21,6 +22,7 @@ export interface SentryConfig {
   /**
    * Also send `error` and `fatal` wide events as Sentry error events, so they open
    * issues and trigger issue alerts. The issue carries the wide event's `trace_id`.
+   * Events with a 4xx status are not sent as issues.
    * Default: false
    */
   issues?: boolean
@@ -52,9 +54,22 @@ export interface SentryErrorEvent {
   environment?: string
   release?: string
   transaction?: string
-  exception: { values: Array<{ type: string, value: string }> }
+  exception: { values: Array<{ type: string, value: string, stacktrace?: { frames: SentryStackFrame[] } }> }
+  /** Set only when the error has no stack, so grouping ignores ids in the message. */
+  fingerprint?: string[]
   contexts: { trace: { trace_id: string, span_id: string, parent_span_id?: string } }
   tags: Record<string, string>
+  user?: { id: string }
+}
+
+/** Sentry stack frame, ordered oldest call first */
+export interface SentryStackFrame {
+  filename: string
+  abs_path: string
+  function?: string
+  lineno?: number
+  colno?: number
+  in_app: boolean
 }
 
 interface SentryDsnParts {
@@ -123,10 +138,9 @@ function nonEmptyString(value: unknown): string | undefined {
   return typeof value === 'string' && value.length > 0 ? value : undefined
 }
 
-/** Give an event without a `traceId` one, so its log and its issue share it. */
 // Generated ids are cached per event so a retried batch resends the same ids and Sentry drops the duplicate issue.
 const tracedEvents = new WeakMap<WideEvent, WideEvent>()
-const issueEventIds = new WeakMap<WideEvent, string>()
+const issueIds = new WeakMap<WideEvent, { eventId: string, spanId: string }>()
 
 function cached<T>(cache: WeakMap<WideEvent, T>, event: WideEvent, create: () => T): T {
   const existing = cache.get(event)
@@ -136,8 +150,40 @@ function cached<T>(cache: WeakMap<WideEvent, T>, event: WideEvent, create: () =>
   return value
 }
 
+/** Give an event without a `traceId` one, so its log and its issue share it. */
 function withTraceId(event: WideEvent): WideEvent {
   return nonEmptyString(event.traceId) ? event : cached(tracedEvents, event, () => ({ ...event, traceId: createTraceId() }))
+}
+
+function getErrorRecord(event: WideEvent): Record<string, unknown> {
+  return (typeof event.error === 'object' && event.error !== null ? event.error : {}) as Record<string, unknown>
+}
+
+/** Client errors (a thrown 404, 401 or validation 400) are expected traffic, not issues. */
+function isClientError(event: WideEvent): boolean {
+  const error = getErrorRecord(event)
+  const status = Number(error.statusCode ?? error.status ?? event.status)
+  return status >= 400 && status < 500
+}
+
+function toSentryFrames(stack: unknown): SentryStackFrame[] {
+  if (typeof stack !== 'string') return []
+  return parseStackFrames(stack)
+    .filter(frame => frame.file)
+    .map(frame => ({
+      filename: frame.file!,
+      abs_path: frame.file!,
+      ...(frame.fn ? { function: frame.fn } : {}),
+      ...(frame.line ? { lineno: frame.line } : {}),
+      ...(frame.column ? { colno: frame.column } : {}),
+      in_app: frame.isApp,
+    }))
+    .reverse()
+}
+
+function getUserId(event: WideEvent): string | undefined {
+  const user = typeof event.user === 'object' && event.user !== null ? event.user as Record<string, unknown> : {}
+  return nonEmptyString(event.userId) ?? nonEmptyString(user.id)
 }
 
 function getFirstStringValue(event: WideEvent, keys: string[]): string | undefined {
@@ -222,16 +268,20 @@ export function toSentryLog(event: WideEvent, config: SentryConfig): SentryLog {
  * issue links to the trace and its logs.
  */
 export function toSentryErrorEvent(event: WideEvent, config: SentryConfig): SentryErrorEvent {
-  const error = (typeof event.error === 'object' && event.error !== null ? event.error : {}) as Record<string, unknown>
+  const error = getErrorRecord(event)
   const method = nonEmptyString(event.method)
   const path = nonEmptyString(event.path)
   const transaction = method && path ? `${method} ${path}` : nonEmptyString(event.action) ?? path
   const parentSpanId = nonEmptyString(event.parentSpanId)
   const environment = config.environment ?? event.environment
   const release = config.release ?? nonEmptyString(event.version)
+  const type = nonEmptyString(error.name) ?? 'Error'
+  const frames = toSentryFrames(error.stack)
+  const userId = getUserId(event)
+  const ids = cached(issueIds, event, () => ({ eventId: createTraceId(), spanId: createTraceId().slice(0, 16) }))
 
   return {
-    event_id: cached(issueEventIds, event, createTraceId),
+    event_id: ids.eventId,
     timestamp: new Date(event.timestamp).getTime() / 1000,
     platform: 'javascript',
     level: event.level === 'fatal' ? 'fatal' : 'error',
@@ -242,19 +292,22 @@ export function toSentryErrorEvent(event: WideEvent, config: SentryConfig): Sent
     exception: {
       values: [
         {
-          type: nonEmptyString(error.name) ?? 'Error',
+          type,
           value: nonEmptyString(error.message) ?? getFirstStringValue(event, ['message', 'action', 'path']) ?? 'evlog wide event',
+          ...(frames.length > 0 ? { stacktrace: { frames } } : {}),
         }
       ],
     },
+    ...(frames.length > 0 ? {} : { fingerprint: transaction ? [type, transaction] : [type] }),
     contexts: {
       trace: {
         trace_id: nonEmptyString(event.traceId) ?? createTraceId(),
-        span_id: nonEmptyString(event.spanId) ?? createTraceId().slice(0, 16),
+        span_id: nonEmptyString(event.spanId) ?? ids.spanId,
         ...(parentSpanId ? { parent_span_id: parentSpanId } : {}),
       },
     },
     tags: { service: event.service, ...config.tags },
+    ...(userId ? { user: { id: userId } } : {}),
   }
 }
 
@@ -367,7 +420,10 @@ export async function sendToSentry(event: WideEvent, config: SentryConfig): Prom
 
 /**
  * Send a batch of events to Sentry as structured logs via the Envelope endpoint.
- * With `issues`, `error` and `fatal` events are also sent as error events.
+ * With `issues`, `error` and `fatal` events without a 4xx status are also sent
+ * as error events, one request at a time after the logs. Only a failed log
+ * request rejects: issues are best-effort, and the first failed issue stops
+ * the remaining ones for this batch.
  *
  * @example
  * ```ts
@@ -379,18 +435,17 @@ export async function sendToSentry(event: WideEvent, config: SentryConfig): Prom
 export async function sendBatchToSentry(events: WideEvent[], config: SentryConfig): Promise<void> {
   if (events.length === 0) return
   const traced = events.map(withTraceId)
-  const requests = [encodeSentryRequest(traced, config)]
-  if (config.issues) {
-    for (const event of traced) {
-      if (event.level === 'error' || event.level === 'fatal') {
-        requests.push(encodeSentryErrorEventRequest(toSentryErrorEvent(event, config), config))
-      }
+  const options = { label: 'Sentry', source: 'sentry', timeout: config.timeout, retries: config.retries }
+  await sendEncodedDrainRequest(encodeSentryRequest(traced, config), options)
+  if (!config.issues) return
+
+  const issues = traced.filter(event => (event.level === 'error' || event.level === 'fatal') && !isClientError(event))
+  for (const [index, event] of issues.entries()) {
+    try {
+      await sendEncodedDrainRequest(encodeSentryErrorEventRequest(toSentryErrorEvent(event, config), config), options)
+    } catch (error) {
+      console.error(`[evlog/sentry] Failed to send issue, skipped ${issues.length - index - 1} more in this batch:`, error)
+      return
     }
   }
-  await Promise.all(requests.map(request => sendEncodedDrainRequest(request, {
-    label: 'Sentry',
-    source: 'sentry',
-    timeout: config.timeout,
-    retries: config.retries,
-  })))
 }

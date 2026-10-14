@@ -368,7 +368,97 @@ describe('sentry adapter', () => {
       const [firstLogs, firstIssue, retryLogs, retryIssue] = envelopes()
       expect(retryIssue?.payload.event_id).toBe(firstIssue?.payload.event_id)
       expect(retryIssue?.payload.contexts.trace.trace_id).toBe(firstIssue?.payload.contexts.trace.trace_id)
+      expect(retryIssue?.payload.contexts.trace.span_id).toBe(firstIssue?.payload.contexts.trace.span_id)
       expect(retryLogs?.payload.items[0].trace_id).toBe(firstLogs?.payload.items[0].trace_id)
+    })
+
+    it('does not open issues for 4xx errors', async () => {
+      await sendBatchToSentry([
+        createTestEvent({ level: 'error', status: 404, error: { name: 'EvlogError', message: 'User 8231 not found', status: 404 } }),
+        createTestEvent({ level: 'error', error: { name: 'H3Error', message: 'Unauthorized', statusCode: 401 } }),
+        createTestEvent({ level: 'error', status: 400, error: { name: 'Error', message: 'Invalid body' } }),
+        createTestEvent({ level: 'error', status: 500, error: { name: 'TypeError', message: 'boom' } }),
+        createTestEvent({ level: 'error', error: { name: 'Error', message: 'job failed' } }),
+      ], { dsn, issues: true })
+
+      const [logs, ...issues] = envelopes()
+      expect(logs?.payload.items).toHaveLength(5)
+      expect(issues.map(e => e.payload.exception.values[0].value)).toEqual(['boom', 'job failed'])
+    })
+
+    it('sends the error stack as frames, oldest call first', () => {
+      const stack = [
+        'TypeError: Cannot read properties of undefined',
+        '    at getUser (/app/server/api/user.ts:12:5)',
+        '    at async handler (/app/server/api/user.ts:30:3)',
+        '    at callHandler (/app/node_modules/h3/dist/index.mjs:100:9)',
+      ].join('\n')
+      const result = toSentryErrorEvent(createTestEvent({ level: 'error', error: { name: 'TypeError', message: 'x', stack } }), { dsn })
+
+      expect(result.exception.values[0]?.stacktrace?.frames).toEqual([
+        { filename: '/app/node_modules/h3/dist/index.mjs', abs_path: '/app/node_modules/h3/dist/index.mjs', function: 'callHandler', lineno: 100, colno: 9, in_app: false },
+        { filename: '/app/server/api/user.ts', abs_path: '/app/server/api/user.ts', function: 'async handler', lineno: 30, colno: 3, in_app: true },
+        { filename: '/app/server/api/user.ts', abs_path: '/app/server/api/user.ts', function: 'getUser', lineno: 12, colno: 5, in_app: true },
+      ])
+      expect(result.fingerprint).toBeUndefined()
+    })
+
+    it('groups a stackless error by type and transaction, not by message', () => {
+      const result = toSentryErrorEvent(createTestEvent({
+        level: 'error',
+        method: 'GET',
+        path: '/api/users/8231',
+        error: { name: 'NotFoundError', message: 'User 8231 not found' },
+      }), { dsn })
+
+      expect(result.exception.values[0]?.stacktrace).toBeUndefined()
+      expect(result.fingerprint).toEqual(['NotFoundError', 'GET /api/users/8231'])
+    })
+
+    it('attaches the user id', () => {
+      expect(toSentryErrorEvent(createTestEvent({ level: 'error', userId: 'u_1' }), { dsn }).user).toEqual({ id: 'u_1' })
+      expect(toSentryErrorEvent(createTestEvent({ level: 'error', user: { id: 'u_2' } }), { dsn }).user).toEqual({ id: 'u_2' })
+      expect(toSentryErrorEvent(createTestEvent({ level: 'error' }), { dsn }).user).toBeUndefined()
+    })
+
+    it('resolves when an issue request fails, so a batch retry does not resend the logs', async () => {
+      const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+      fetchSpy
+        .mockResolvedValueOnce(new Response(null, { status: 200 }))
+        .mockResolvedValueOnce(new Response('Too Many Requests', { status: 429, statusText: 'Too Many Requests' }))
+
+      await expect(sendBatchToSentry([
+        createTestEvent({ level: 'error', error: { name: 'Error', message: 'first' } }),
+        createTestEvent({ level: 'error', error: { name: 'Error', message: 'second' } }),
+      ], { dsn, issues: true, retries: 0 })).resolves.toBeUndefined()
+
+      expect(envelopes().map(e => e.item.type)).toEqual(['log', 'event'])
+      expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining('skipped 1 more'), expect.any(Error))
+    })
+
+    it('rejects without sending issues when the log request fails', async () => {
+      fetchSpy.mockResolvedValueOnce(new Response('Bad Gateway', { status: 502, statusText: 'Bad Gateway' }))
+
+      await expect(sendBatchToSentry([createTestEvent({ level: 'error' })], { dsn, issues: true, retries: 0 }))
+        .rejects.toThrow('Sentry API error: 502')
+      expect(fetchSpy).toHaveBeenCalledOnce()
+    })
+
+    it('sends issue requests one at a time', async () => {
+      let inFlight = 0
+      let maxInFlight = 0
+      fetchSpy.mockImplementation(async () => {
+        inFlight++
+        maxInFlight = Math.max(maxInFlight, inFlight)
+        await new Promise(resolve => setTimeout(resolve, 1))
+        inFlight--
+        return new Response(null, { status: 200 })
+      })
+
+      await sendBatchToSentry(Array.from({ length: 5 }, () => createTestEvent({ level: 'error' })), { dsn, issues: true })
+
+      expect(fetchSpy).toHaveBeenCalledTimes(6)
+      expect(maxInFlight).toBe(1)
     })
 
     it('reads issues from the drain config', async () => {
