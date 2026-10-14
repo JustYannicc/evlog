@@ -15,7 +15,7 @@ which surface it came from. Every cost claim in this project was measured from
 these events rather than estimated.
 
 Tool executes enrich the same event with their outcome, in the pattern
-`tools/memory.ts` set: one namespace per domain, holding counts, reason codes,
+`tools/git.ts` set: one namespace per domain, holding counts, reason codes,
 and identifiers Evi authored. Never raw error strings, tool payloads, or
 untrusted URLs, so the metadata-only PostHog policy holds. The namespaces:
 `git.{branch,pushed,sha,reason,exitCode}`, `git.checkout.{repository,done,sha,reason,exitCode}`, `git.install.{repository,done,reason,exitCode}`,
@@ -24,8 +24,7 @@ untrusted URLs, so the metadata-only PostHog policy holds. The namespaces:
 `vercel.{env,key,project,target,reason,status}`,
 `gateway.report.{mode,groupBy,matchedRows}`,
 `content.{scanned,candidates,eligible,targets,group,surface,reason}`,
-`image.{host,fetched,bytes,mediaType,reason}`, and
-`memory.{saved,refused,searched,hits}`. A content pass that held everything or
+`image.{host,fetched,bytes,mediaType,reason}`. A content pass that held everything or
 a push that was refused is chartable from the turn event alone. Tool executes
 are the one place `useLogger()` is contractually bound (see the caller gap
 below); hooks and the subagents stay uninstrumented, and the two pieces of
@@ -100,17 +99,16 @@ itself and eve keeps traces local.
 by design, so 17 turn events across a full suite produced zero rollups. It is
 configured, not confirmed. Check it against a real GitHub thread that ends.
 
-## The gap: nothing identifies the caller
+## Who asked: the caller on the turn
 
-A turn event says what happened and what it cost. It does not say **who asked**.
+A turn event says what happened and what it cost. `evlog/eve` also records **who asked** as `eve.caller`.
 On a repository bot that is the dimension you most want to group by: cost per
 user, volume per user, refusals per user, and after the tier work in
 [authorization.md](./authorization.md), which tier a turn ran at.
 
-This is not an oversight in the configuration; there is no supported path.
-`evlog/eve` builds the event from the eve stream, and the enrich hook it exposes
-is HTTP-shaped, `{ event, request, headers, response }`, with no reference to
-the eve session, so `session.auth` is unreachable from it. Three attempts, all
+Before `enrichTurn` shipped (see Proposals), there was no supported path to the
+eve session from enrichment: `enrich` is HTTP-shaped, `{ event, request, headers, response }`,
+so `session.auth` was unreachable from it. Three attempts, all
 from an authored eve hook calling `useLogger().set({ caller })`:
 
 | Approach | Turns annotated |
@@ -135,43 +133,6 @@ to be empty.
 
 ## Proposals
 
-### evlog/eve: let `defineEvlogInstrumentation` take `events`
-
-Superseded before anyone took it up: the supported composition path shipped
-instead. `evlogRuntimeContext(input)` is exported from `evlog/eve`, and a
-caller whose instrumentation is not evlog's alone drops the wrapper and spreads
-it into their own `defineInstrumentation`, the merge the proposal wanted, done
-by the caller (documented on `defineEvlogInstrumentation` in
-`packages/evlog/src/eve/index.ts`).
-
-### evlog/eve: reach the eve session from enrichment
-
-Landed: `defineEvlogHook()` takes `enrichTurn`, a turn-scoped callback that runs
-where the turn logger is created, with the eve session in scope:
-
-```ts
-defineEvlogHook({
-  enrichTurn: (ctx) => ({ caller: ctx.session.auth.current?.principalId }),
-})
-```
-
-Returned fields merge onto the turn event, over the built-ins, and are not
-carried across turns of the same session. The shape decision: `enrich` stays
-HTTP-shaped because it is part of `BaseEvlogOptions`, shared by every framework
-integration, and widening it would put the eve session into every HTTP
-integration's contract. A turn-scoped option on the eve hook keeps it local and
-removes the hook-ordering guesswork.
-
-### evlog/eve: attribute input tokens to the tool that caused them
-
-Landed (#622, EVL-289): `ai.tools[]` entries now carry `inputTokens`, a step
-delta split across the tools that fed the model.
-
-### evlog/eve: record the resolved provider
-
-Landed (#622): the deployment that served the call is on the event as
-`ai.provider`.
-
 ### eve: preserve a thrown error's `code` on tool results and `turn.failed`
 
 A tool that throws an error carrying `code` (evlog's `EvlogError`, any
@@ -182,12 +143,6 @@ tool result (and `details.code` on the failure events) would let `evlog/eve`
 record it on `ai.tools[]`, and let a channel's failure comment print the
 application's code rather than `EVENT_HANDLER_FAILED`. Until then, Evi's
 catalog is visible through refusal results and `reason` fields only.
-
-### github-tools: surface GitHub rate-limit state on tool results
-
-Landed upstream in the github-tools extension (EVL-343, 2026-08-27): the
-tool's result surface now exposes the rate-limit state and the eve extension
-records it.
 
 ### github-tools: per-session tool scoping
 
