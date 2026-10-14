@@ -445,20 +445,19 @@ describe('sentry adapter', () => {
     })
 
     it('sends issue requests one at a time', async () => {
-      let inFlight = 0
-      let maxInFlight = 0
-      fetchSpy.mockImplementation(async () => {
-        inFlight++
-        maxInFlight = Math.max(maxInFlight, inFlight)
-        await new Promise(resolve => setTimeout(resolve, 1))
-        inFlight--
-        return new Response(null, { status: 200 })
-      })
+      const inFlight: Array<() => void> = []
+      fetchSpy.mockImplementation(() => new Promise<Response>((resolve) => {
+        inFlight.push(() => resolve(new Response(null, { status: 200 })))
+      }))
 
-      await sendBatchToSentry(Array.from({ length: 5 }, () => createTestEvent({ level: 'error' })), { dsn, issues: true })
+      const sending = sendBatchToSentry(Array.from({ length: 5 }, () => createTestEvent({ level: 'error' })), { dsn, issues: true })
+      for (let call = 0; call < 6; call++) {
+        await vi.waitFor(() => expect(inFlight).toHaveLength(1))
+        defined(inFlight.shift(), 'pending request')()
+      }
+      await sending
 
       expect(fetchSpy).toHaveBeenCalledTimes(6)
-      expect(maxInFlight).toBe(1)
     })
 
     it('reads issues from the drain config', async () => {
