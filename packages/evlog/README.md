@@ -325,7 +325,7 @@ Notes:
 - `request.cf` is included (colo, country, asn) unless disabled
 - Use `headerAllowlist` to avoid logging sensitive headers
 
-## Effect
+## Effect (beta)
 
 `evlog/effect` gives every request served by Effect's `HttpRouter` or `HttpApi` one wide event. Handlers read it from the Effect context with `yield* EvlogLogger`, and failures are recorded from the `Cause`. It needs `effect` 4 and no `AsyncLocalStorage`, so it runs on Cloudflare Workers without `nodejs_compat`.
 
@@ -515,7 +515,7 @@ In production (`pretty: false`), logs are emitted as JSON for machine parsing.
 | **Fastify** | `app.register(evlog)` with `import { evlog } from 'evlog/fastify'` ([docs](https://evlog.dev/integrate/frameworks/fastify)) |
 | **Elysia** | `.use(evlog())` with `import { evlog } from 'evlog/elysia'` ([docs](https://evlog.dev/integrate/frameworks/elysia)) |
 | **oRPC** | `withEvlog(handler)` + `os.use(evlog())` with `import { evlog, withEvlog } from 'evlog/orpc'` ([docs](https://evlog.dev/integrate/frameworks/orpc)) |
-| **Effect** | `Layer.provide(routerLayer())` with `import { routerLayer } from 'evlog/effect'` ([docs](https://evlog.dev/integrate/frameworks/effect)) |
+| **Effect** (beta) | `Layer.provide(routerLayer())` with `import { routerLayer } from 'evlog/effect'` ([docs](https://evlog.dev/integrate/frameworks/effect)) |
 | **eve** | `defineEvlogHook()` in `agent/hooks/evlog.ts` with `import { defineEvlogHook, useLogger } from 'evlog/eve'` ([docs](https://evlog.dev/use-cases/eve)) |
 | **Cloudflare Workers** | Manual setup with `import { initWorkersLogger, createWorkersLogger } from 'evlog/workers'` ([docs](https://evlog.dev/integrate/frameworks/cloudflare-workers)) |
 | **Custom** | Build your own with `import { createMiddlewareLogger } from 'evlog/toolkit'` ([guide](https://evlog.dev/extend/custom-framework)) |
